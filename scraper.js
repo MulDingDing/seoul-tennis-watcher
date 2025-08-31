@@ -1,28 +1,42 @@
-// scraper.js — 렌더링된 달력에서 "선택 가능 날짜" 수집 + 디버그 알림/스크린샷
+// scraper.js — 렌더링된 달력에서 "선택 가능 날짜" 수집 + 디버그/스크린샷/견고한 예외처리
 import { chromium } from "playwright";
+import fs from "fs/promises";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID   = process.env.CHAT_ID;
-
-// ✅ 디버그 모드: true면 "가능 0건"이어도 상태를 텔레그램으로 보냄
 const DEBUG_NOTIFY = (process.env.DEBUG_NOTIFY || "true").toLowerCase() === "true";
 
-// 모니터링할 페이지들
+// 모니터링할 페이지들 — 필요시 추가
 const URLS = [
   "https://yeyak.seoul.go.kr/web/reservation/selectReservView.do?rsv_svc_id=S250813165159850005"
 ];
 
-const SCAN_MONTHS_AHEAD = 2;         // 현재 달 포함, 다음 n개월
+// 스캔 설정
+const SCAN_MONTHS_AHEAD = 2;   // 현재 달 포함 n개월 앞으로
 const WAIT_MS = 1200;
 const TZ = "Asia/Seoul";
 
+// 판정 패턴
 const NEG_CLASSES = /(disabled|disable|dim|off|blocked|soldout|unavailable|closed|end|finish|over|unselectable)/i;
 const NEG_TEXT    = /(예약\s*마감|예약마감|접수마감|마감되었습니다|마감\b|불가\b|대기\b|sold\s*out|unavailable|불가능)/i;
 
+// 다음달 버튼 후보
 const NEXT_SELECTORS = [
   '[aria-label*="다음"]',
   "button.next","a.next",".next",".nextMonth",".ui-datepicker-next",".cal_next",
   'a[onclick*="next"]','button[onclick*="next"]'
+];
+
+// 달력/컨텐트가 준비됐는지 대기할 때 쓸 후보 셀렉터
+const CALENDAR_HINTS = [
+  "[data-date]", "td[data-date]", ".calendar", ".ui-datepicker-calendar", ".cal_tbl"
+];
+
+// 팝업/동의/탭 전환 시도용(있을 때만 눌러봄)
+const DISMISSORS = [
+  'button:has-text("확인")', 'button:has-text("동의")', 'button:has-text("닫기")',
+  'a:has-text("확인")', 'a:has-text("동의")', 'a:has-text("닫기")',
+  '.btn_confirm', '.btn_ok', '.btn_close'
 ];
 
 function dow(ymd) {
@@ -38,13 +52,43 @@ async function sendTelegram(text) {
     return;
   }
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "content-type":"application/json" },
-    body: JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true })
-  });
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type":"application/json" },
+      body: JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true })
+    });
+  } catch (e) {
+    console.log("[WARN] sendTelegram failed:", e);
+  }
 }
 function unique(arr){ return Array.from(new Set(arr)); }
+
+// 잠깐 기다리기
+const nap = (ms)=> new Promise(r=> setTimeout(r, ms));
+
+async function waitForCalendar(page) {
+  for (const sel of CALENDAR_HINTS) {
+    try {
+      const el = await page.waitForSelector(sel, { timeout: 3000 });
+      if (el) return true;
+    } catch(_) {}
+  }
+  return false;
+}
+
+async function dismissPopups(page) {
+  // 동의/확인/닫기 비동기 시도
+  for (const sel of DISMISSORS) {
+    try {
+      const el = await page.$(sel);
+      if (el && await el.isVisible()) {
+        await el.click().catch(()=>{});
+        await nap(400);
+      }
+    } catch(_) {}
+  }
+}
 
 async function grabSelectableDates(page) {
   const dates = await page.evaluate(({ NEG_CLASSES, NEG_TEXT }) => {
@@ -83,79 +127,4 @@ async function grabSelectableDates(page) {
 }
 
 async function clickNextMonth(page){
-  for (const sel of NEXT_SELECTORS){
-    try {
-      const el = await page.$(sel);
-      if (!el) continue;
-      if (await el.isEnabled()) {
-        await el.click();
-        return true;
-      }
-    } catch(_) {}
-  }
-  const candidates = await page.$$('a,button');
-  for (const c of candidates){
-    const t = (await c.textContent() || "").trim();
-    if (/다음|next|▶|≫/i.test(t)) {
-      try { if (await c.isEnabled()){ await c.click(); return true; } } catch(_){}
-    }
-  }
-  return false;
-}
-
-async function scanOne(url, idx){
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ timezoneId: TZ, locale: "ko-KR" });
-  const page = await context.newPage();
-
-  try{
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(WAIT_MS);
-
-    // 첫 화면 스크린샷
-    await page.screenshot({ path: `out/month0_${idx}.png`, fullPage: true });
-
-    let all = await grabSelectableDates(page);
-
-    for (let i=0;i<SCAN_MONTHS_AHEAD;i++){
-      const moved = await clickNextMonth(page);
-      if (!moved) break;
-      await page.waitForTimeout(WAIT_MS);
-      await page.screenshot({ path: `out/month${i+1}_${idx}.png`, fullPage: true });
-      const more = await grabSelectableDates(page);
-      all = unique(all.concat(more));
-    }
-    return all.sort();
-  } finally {
-    await browser.close();
-  }
-}
-
-async function main(){
-  await sendTelegram("🟢 시작: 테니스 예약 감시를 실행합니다.");
-
-  let blocks = [];
-  for (let i=0;i<URLS.length;i++){
-    const url = URLS[i];
-    const dates = await scanOne(url, i);
-    if (dates.length === 0) {
-      if (DEBUG_NOTIFY) {
-        await sendTelegram(`ℹ️ 현재 예약 가능 날짜 없음\n🔗 ${url}`);
-      }
-      continue;
-    }
-    const summary = summarizeDates(dates);
-    blocks.push(`🎾 <b>예약 가능 날짜</b>\n${summary}\n🔗 ${url}`);
-  }
-  if (blocks.length > 0){
-    const msg = blocks.join("\n\n") + `\n\n⏰ ${new Date().toLocaleString("ko-KR",{ timeZone: TZ })}`;
-    await sendTelegram(msg);
-  } else if (DEBUG_NOTIFY) {
-    await sendTelegram("📭 모든 대상에서 현재 예약 가능 날짜가 없습니다.");
-  }
-}
-
-main().catch(async (e)=>{
-  try { await sendTelegram(`⚠️ 스크립트 오류: ${String(e).slice(0,900)}`); } catch (_) {}
-  process.exit(1);
-});
+  for (const sel of
