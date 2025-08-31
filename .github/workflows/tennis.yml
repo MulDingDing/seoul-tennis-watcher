@@ -2,8 +2,8 @@ name: tennis-watch
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}
+    - cron: "*/5 * * * *"   # 5분마다 (UTC 기준)
+  workflow_dispatch: {}      # 수동 실행 버튼
 
 jobs:
   run:
@@ -22,19 +22,36 @@ jobs:
           npm install
           npx playwright install --with-deps
 
-      - name: Run scraper
+      - name: Run scraper (with debug)
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID:   ${{ secrets.CHAT_ID }}
           DEBUG_NOTIFY: "true"
         run: |
-          mkdir -p out
-          npm start
+          mkdir -p out logs
+          node --version
+          node scraper.js || true     # ← 실패해도 파이프라인은 계속 진행
 
-      - name: Upload screenshots (artifacts)
+      - name: List outputs
+        if: always()
+        run: |
+          echo "---- out ----"
+          ls -al out || true
+          echo "---- logs ----"
+          ls -al logs || true
+
+      - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots
           path: out/*.png
-          if-no-files-found: ignore
+          if-no-files-found: warn
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: logs/*
+          if-no-files-found: warn
