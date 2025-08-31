@@ -127,4 +127,98 @@ async function grabSelectableDates(page) {
 }
 
 async function clickNextMonth(page){
-  for (const sel of
+  for (const sel of NEXT_SELECTORS){
+    try {
+      const el = await page.$(sel);
+      if (!el) continue;
+      if (await el.isEnabled()) {
+        await el.click();
+        return true;
+      }
+    } catch(_) {}
+  }
+  const candidates = await page.$$('a,button');
+  for (const c of candidates){
+    const t = (await c.textContent() || "").trim();
+    if (/다음|next|▶|≫/i.test(t)) {
+      try { if (await c.isEnabled()){ await c.click(); return true; } } catch(_){}
+    }
+  }
+  return false;
+}
+
+async function scanOne(url, idx){
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ timezoneId: TZ, locale: "ko-KR" });
+  const page = await context.newPage();
+
+  try{
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await nap(WAIT_MS);
+    await dismissPopups(page);                // 1) 팝업/동의 닫기
+    await waitForCalendar(page);              // 2) 달력 힌트 대기
+    await page.screenshot({ path: `out/month0_${idx}.png`, fullPage: true });
+
+    let all = await grabSelectableDates(page);
+
+    for (let i=0;i<SCAN_MONTHS_AHEAD;i++){
+      const moved = await clickNextMonth(page);
+      if (!moved) break;
+      await nap(WAIT_MS);
+      await waitForCalendar(page);
+      await dismissPopups(page);
+      await page.screenshot({ path: `out/month${i+1}_${idx}.png`, fullPage: true });
+      const more = await grabSelectableDates(page);
+      all = unique(all.concat(more));
+    }
+    return all.sort();
+  } finally {
+    await browser.close();
+  }
+}
+
+async function main(){
+  try { await fs.mkdir("logs", { recursive: true }); } catch(_) {}
+  try { await fs.mkdir("out",  { recursive: true }); } catch(_) {}
+
+  await sendTelegram("🟢 시작: 테니스 예약 감시 실행");
+
+  const summaries = [];
+  for (let i=0;i<URLS.length;i++){
+    const url = URLS[i];
+    try {
+      const dates = await scanOne(url, i);
+      if (dates.length > 0) {
+        summaries.push(`🎾 <b>예약 가능 날짜</b>\n${summarizeDates(dates)}\n🔗 ${url}`);
+      } else if (DEBUG_NOTIFY) {
+        await sendTelegram(`ℹ️ 현재 예약 가능 날짜 0건\n🔗 ${url}`);
+      }
+    } catch (e) {
+      const msg = `⚠️ URL 처리 중 오류\n${url}\n${String(e).slice(0,500)}`;
+      console.error(msg);
+      await fs.writeFile(`logs/error_${Date.now()}_${i}.txt`, msg).catch(()=>{});
+      await sendTelegram(msg);
+    }
+  }
+
+  if (summaries.length > 0) {
+    const final = summaries.join("\n\n") + `\n\n⏰ ${new Date().toLocaleString("ko-KR",{ timeZone: TZ })}`;
+    await sendTelegram(final);
+  } else if (DEBUG_NOTIFY) {
+    await sendTelegram("📭 모든 대상에서 현재 예약 가능 날짜 없음");
+  }
+}
+
+// 메인 실행: 실패해도 프로세스는 0으로 종료하여 아티팩트 업로드 보장
+(async () => {
+  try {
+    await main();
+  } catch (e) {
+    const msg = `💥 치명적 오류: ${String(e).slice(0,900)}`;
+    console.error(msg);
+    try { await fs.writeFile(`logs/fatal_${Date.now()}.txt`, msg); } catch(_){}
+    await sendTelegram(msg);
+  } finally {
+    process.exit(0);
+  }
+})();
