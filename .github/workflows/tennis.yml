@@ -2,8 +2,8 @@ name: tennis-watch
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5분마다 (UTC 기준)
-  workflow_dispatch: {}      # 수동 실행 버튼
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
 
 jobs:
   run:
@@ -26,4 +26,15 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID:   ${{ secrets.CHAT_ID }}
-        run: npm start
+          DEBUG_NOTIFY: "true"
+        run: |
+          mkdir -p out
+          npm start
+
+      - name: Upload screenshots (artifacts)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: out/*.png
+          if-no-files-found: ignore
