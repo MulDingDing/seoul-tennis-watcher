@@ -19,7 +19,7 @@ jobs:
 
       - name: Install deps
         run: |
-          npm ci
+          npm install
           npx playwright install --with-deps
 
       - name: Run scraper
