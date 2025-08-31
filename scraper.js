@@ -1,21 +1,21 @@
-// scraper.js — 렌더링된 달력에서 "선택 가능 날짜"를 수집해 텔레그램으로 전송
+// scraper.js — 렌더링된 달력에서 "선택 가능 날짜" 수집 + 디버그 알림/스크린샷
 import { chromium } from "playwright";
 
-// ▼ 텔레그램 정보: GitHub Secrets가 있으면 자동으로 그 값을 씁니다(하드코딩은 하지 마세요!)
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID   = process.env.CHAT_ID;
 
-// 모니터링할 페이지들 (원하는 주소 계속 추가)
+// ✅ 디버그 모드: true면 "가능 0건"이어도 상태를 텔레그램으로 보냄
+const DEBUG_NOTIFY = (process.env.DEBUG_NOTIFY || "true").toLowerCase() === "true";
+
+// 모니터링할 페이지들
 const URLS = [
   "https://yeyak.seoul.go.kr/web/reservation/selectReservView.do?rsv_svc_id=S250813165159850005"
 ];
 
-// 설정
-const SCAN_MONTHS_AHEAD = 2;          // 현재 달 포함 다음 몇 달까지 넘겨볼지
-const WAIT_MS = 1200;                  // 페이지 이동/렌더 대기(ms)
+const SCAN_MONTHS_AHEAD = 2;         // 현재 달 포함, 다음 n개월
+const WAIT_MS = 1200;
 const TZ = "Asia/Seoul";
 
-// “비활성/마감” 신호
 const NEG_CLASSES = /(disabled|disable|dim|off|blocked|soldout|unavailable|closed|end|finish|over|unselectable)/i;
 const NEG_TEXT    = /(예약\s*마감|예약마감|접수마감|마감되었습니다|마감\b|불가\b|대기\b|sold\s*out|unavailable|불가능)/i;
 
@@ -33,7 +33,10 @@ function summarizeDates(dates) {
   return dates.sort().map(d => `• ${d} (${dow(d)})`).join("\n");
 }
 async function sendTelegram(text) {
-  if (!BOT_TOKEN || !CHAT_ID) throw new Error("BOT_TOKEN/CHAT_ID env missing");
+  if (!BOT_TOKEN || !CHAT_ID) {
+    console.log("[WARN] Missing BOT_TOKEN or CHAT_ID");
+    return;
+  }
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
   await fetch(url, {
     method: "POST",
@@ -100,7 +103,7 @@ async function clickNextMonth(page){
   return false;
 }
 
-async function scanOne(url){
+async function scanOne(url, idx){
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ timezoneId: TZ, locale: "ko-KR" });
   const page = await context.newPage();
@@ -109,12 +112,16 @@ async function scanOne(url){
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
     await page.waitForTimeout(WAIT_MS);
 
+    // 첫 화면 스크린샷
+    await page.screenshot({ path: `out/month0_${idx}.png`, fullPage: true });
+
     let all = await grabSelectableDates(page);
 
     for (let i=0;i<SCAN_MONTHS_AHEAD;i++){
       const moved = await clickNextMonth(page);
       if (!moved) break;
       await page.waitForTimeout(WAIT_MS);
+      await page.screenshot({ path: `out/month${i+1}_${idx}.png`, fullPage: true });
       const more = await grabSelectableDates(page);
       all = unique(all.concat(more));
     }
@@ -125,16 +132,26 @@ async function scanOne(url){
 }
 
 async function main(){
+  await sendTelegram("🟢 시작: 테니스 예약 감시를 실행합니다.");
+
   let blocks = [];
-  for (const url of URLS){
-    const dates = await scanOne(url);
-    if (dates.length === 0) continue;
+  for (let i=0;i<URLS.length;i++){
+    const url = URLS[i];
+    const dates = await scanOne(url, i);
+    if (dates.length === 0) {
+      if (DEBUG_NOTIFY) {
+        await sendTelegram(`ℹ️ 현재 예약 가능 날짜 없음\n🔗 ${url}`);
+      }
+      continue;
+    }
     const summary = summarizeDates(dates);
     blocks.push(`🎾 <b>예약 가능 날짜</b>\n${summary}\n🔗 ${url}`);
   }
   if (blocks.length > 0){
     const msg = blocks.join("\n\n") + `\n\n⏰ ${new Date().toLocaleString("ko-KR",{ timeZone: TZ })}`;
     await sendTelegram(msg);
+  } else if (DEBUG_NOTIFY) {
+    await sendTelegram("📭 모든 대상에서 현재 예약 가능 날짜가 없습니다.");
   }
 }
 
